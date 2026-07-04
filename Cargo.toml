@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-correspondence-analysis"
-version = "0.1.0"
+version = "0.1.1"
 description = "Correspondence Analysis (CA) of a non-negative feature/count table — scikit-bio skbio.stats.ordination.ca equivalent (chi-square transform + SVD)"
 edition = "2024"
 rust-version = "1.91"

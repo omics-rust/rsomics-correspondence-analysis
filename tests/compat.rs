@@ -205,6 +205,62 @@ fn matches_committed_golden() {
     compare(&ours, &theirs, "golden");
 }
 
+/// Degenerate tables (all-zero column, all-zero row, NaN, inf) must fail
+/// loud — a clean non-zero exit, never a panic or hang. skbio `ca` rejects
+/// each of these with `ValueError('array must not contain infs or NaNs')`;
+/// the live test below confirms the oracle rejection stays in lockstep.
+#[test]
+fn rejects_degenerate_inputs() {
+    for table in [
+        "degenerate_zerocol.tsv",
+        "degenerate_zerorow.tsv",
+        "degenerate_nan.tsv",
+        "degenerate_inf.tsv",
+    ] {
+        let out = Command::new(ours_bin())
+            .arg(fixture(table))
+            .output()
+            .expect("run ours");
+        assert!(
+            !out.status.success(),
+            "{table}: expected non-zero exit, got success"
+        );
+        assert_ne!(
+            out.status.code(),
+            Some(101),
+            "{table}: exited 101 (panic) instead of failing loud"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{table}: stderr shows a panic, not a clean error: {stderr}"
+        );
+        assert!(!stderr.is_empty(), "{table}: no error message on stderr");
+    }
+}
+
+/// The oracle rejects every degenerate table too (loud-skip if skbio absent).
+#[test]
+fn oracle_rejects_degenerate_inputs() {
+    let Some(py) = skbio_python() else { return };
+    for table in [
+        "degenerate_zerocol.tsv",
+        "degenerate_zerorow.tsv",
+        "degenerate_nan.tsv",
+        "degenerate_inf.tsv",
+    ] {
+        let out = Command::new(&py)
+            .arg(oracle_script())
+            .arg(fixture(table))
+            .output()
+            .expect("run oracle");
+        assert!(
+            !out.status.success(),
+            "{table}: oracle unexpectedly succeeded; ours rejects it"
+        );
+    }
+}
+
 /// Live differential against an installed scikit-bio, loud-skip if absent.
 #[test]
 fn matches_live_skbio() {

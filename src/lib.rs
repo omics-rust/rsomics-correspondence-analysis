@@ -19,8 +19,9 @@ pub struct FeatureTable {
 
 impl FeatureTable {
     /// # Errors
-    /// Errors on a missing header, a ragged body, a non-numeric cell, or a
-    /// negative value (CA's chi-square transform is undefined for those).
+    /// Errors on a missing header, a ragged body, a non-numeric cell, a
+    /// non-finite (inf/NaN) cell, or a negative value (CA's chi-square
+    /// transform is undefined for those).
     pub fn parse<R: BufRead>(reader: R, delim: char) -> Result<FeatureTable> {
         let mut lines = reader.lines();
         let header = loop {
@@ -65,6 +66,11 @@ impl FeatureTable {
                         field.trim()
                     ))
                 })?;
+                if !v.is_finite() {
+                    return Err(RsomicsError::InvalidInput(
+                        "input matrix must not contain infs or NaNs".into(),
+                    ));
+                }
                 if v < 0.0 {
                     return Err(RsomicsError::InvalidInput(
                         "input matrix elements must be non-negative".into(),
@@ -119,12 +125,21 @@ pub struct Ordination {
 impl Ordination {
     /// CA via the chi-square transform (Legendre & Legendre 9.32) then SVD.
     /// `n_axes` caps the number of retained axes; `None` keeps the full rank.
-    #[must_use]
-    pub fn compute(table: &FeatureTable, n_axes: Option<usize>) -> Ordination {
+    ///
+    /// # Errors
+    /// Errors when a sample row or feature column sums to zero (a zero
+    /// marginal makes the chi-square transform divide by zero → inf/NaN),
+    /// matching skbio `ca`'s `ValueError('array must not contain infs or NaNs')`.
+    pub fn compute(table: &FeatureTable, n_axes: Option<usize>) -> Result<Ordination> {
         let r = table.n_samples();
         let c = table.n_features();
 
         let grand_total: f64 = table.data.iter().sum();
+        if grand_total <= 0.0 {
+            return Err(RsomicsError::InvalidInput(
+                "input matrix is all zeros; correspondence analysis is undefined".into(),
+            ));
+        }
         let q: Vec<f64> = table.data.iter().map(|&x| x / grand_total).collect();
 
         let mut row_marginals = vec![0.0_f64; r];
@@ -136,6 +151,20 @@ impl Ordination {
                 col_marginals[j] += v;
             }
         }
+        if let Some(i) = row_marginals.iter().position(|&m| m <= 0.0) {
+            return Err(RsomicsError::InvalidInput(format!(
+                "sample '{}' has an all-zero row; its chi-square marginal is zero \
+                 (skbio ca rejects this as 'array must not contain infs or NaNs')",
+                table.sample_ids[i]
+            )));
+        }
+        if let Some(j) = col_marginals.iter().position(|&m| m <= 0.0) {
+            return Err(RsomicsError::InvalidInput(format!(
+                "feature '{}' has an all-zero column; its chi-square marginal is zero \
+                 (skbio ca rejects this as 'array must not contain infs or NaNs')",
+                table.feature_ids[j]
+            )));
+        }
 
         // Q_bar = (Q - E) / sqrt(E), E = row_marginal ⊗ col_marginal  (Eq. 9.32)
         let q_bar = Mat::from_fn(r, c, |i, j| {
@@ -143,7 +172,11 @@ impl Ordination {
             (q[i * c + j] - e) / e.sqrt()
         });
 
-        let svd: Svd<f64> = q_bar.svd().unwrap();
+        let svd: Svd<f64> = q_bar.svd().map_err(|e| {
+            RsomicsError::InvalidInput(format!(
+                "SVD failed to converge on the chi-square-transformed matrix: {e:?}"
+            ))
+        })?;
         let s = svd.S().column_vector();
         let u_hat = svd.U();
         let v_right = svd.V();
@@ -201,14 +234,14 @@ impl Ordination {
         let total: f64 = (0..rank).map(|a| s[a] * s[a]).sum();
         let proportion_explained: Vec<f64> = eigvals.iter().map(|&v| v / total).collect();
 
-        Ordination {
+        Ok(Ordination {
             sample_ids: table.sample_ids.clone(),
             feature_ids: table.feature_ids.clone(),
             eigvals,
             proportion_explained,
             sample_scores,
             feature_scores,
-        }
+        })
     }
 
     /// Write a flat ordination TSV: an `# eigenvalues` block, a sample-score
@@ -283,7 +316,7 @@ pub fn run<R: BufRead, W: Write>(
     n_axes: Option<usize>,
 ) -> Result<()> {
     let table = FeatureTable::parse(reader, delim)?;
-    let ord = Ordination::compute(&table, n_axes);
+    let ord = Ordination::compute(&table, n_axes)?;
     ord.write_tsv(out)
 }
 
@@ -318,11 +351,49 @@ mod tests {
         assert!(FeatureTable::parse(bad.as_bytes(), '\t').is_err());
     }
 
+    #[test]
+    fn nan_cell_rejected_at_parse() {
+        let bad = "\tA\tB\tC\nS1\t1\tnan\t2\nS2\t3\t2\t4\n";
+        assert!(FeatureTable::parse(bad.as_bytes(), '\t').is_err());
+    }
+
+    #[test]
+    fn inf_cell_rejected_at_parse() {
+        let bad = "\tA\tB\tC\nS1\t1\tinf\t2\nS2\t3\t2\t4\n";
+        assert!(FeatureTable::parse(bad.as_bytes(), '\t').is_err());
+    }
+
+    #[test]
+    fn zero_column_margin_errors() {
+        let t = FeatureTable::parse(
+            "\tA\tB\tC\nS1\t1\t0\t2\nS2\t3\t0\t4\nS3\t5\t0\t1\n".as_bytes(),
+            '\t',
+        )
+        .unwrap();
+        assert!(Ordination::compute(&t, None).is_err());
+    }
+
+    #[test]
+    fn zero_row_margin_errors() {
+        let t = FeatureTable::parse(
+            "\tA\tB\tC\nS1\t1\t2\t2\nS2\t0\t0\t0\nS3\t5\t3\t1\n".as_bytes(),
+            '\t',
+        )
+        .unwrap();
+        assert!(Ordination::compute(&t, None).is_err());
+    }
+
+    #[test]
+    fn all_zero_table_errors() {
+        let t = FeatureTable::parse("\tA\tB\nS1\t0\t0\nS2\t0\t0\n".as_bytes(), '\t').unwrap();
+        assert!(Ordination::compute(&t, None).is_err());
+    }
+
     /// L&L 1998 table 9.11; values verified against skbio ca().
     #[test]
     fn matches_known_eigenvalues() {
         let t = FeatureTable::parse(ll_table().as_bytes(), '\t').unwrap();
-        let o = Ordination::compute(&t, None);
+        let o = Ordination::compute(&t, None).unwrap();
         assert_eq!(o.eigvals.len(), 2);
         assert!((o.eigvals[0] - 0.09613302).abs() < 1e-7, "{}", o.eigvals[0]);
         assert!((o.eigvals[1] - 0.04094181).abs() < 1e-7, "{}", o.eigvals[1]);
@@ -334,7 +405,7 @@ mod tests {
     #[test]
     fn n_axes_caps_output() {
         let t = FeatureTable::parse(ll_table().as_bytes(), '\t').unwrap();
-        let o = Ordination::compute(&t, Some(1));
+        let o = Ordination::compute(&t, Some(1)).unwrap();
         assert_eq!(o.eigvals.len(), 1);
         assert_eq!(o.sample_scores.len(), 3);
         assert_eq!(o.feature_scores.len(), 3);
@@ -345,7 +416,7 @@ mod tests {
         // Scaling-1 euclidean distance between sample scores equals the
         // chi-square distance between rows of the original table.
         let t = FeatureTable::parse(ll_table().as_bytes(), '\t').unwrap();
-        let o = Ordination::compute(&t, None);
+        let o = Ordination::compute(&t, None).unwrap();
         let r = t.n_samples();
         let a = o.eigvals.len();
         let chi = chi_square_rows(&t);
